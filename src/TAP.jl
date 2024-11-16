@@ -61,31 +61,34 @@ function Base.download(tap::TAPService, query::AbstractString, path=tempname(); 
         download(uri, path)
     else
         # XXX: try to make the same request with HTTP.jl
-        fmtpart = isnothing(tap.format) ? `` : `-F FORMAT="$(tap.format)"`
-        cmd = `
-            curl
-            -F REQUEST=doQuery
-            -F LANG=ADQL
-            $fmtpart
-            -F QUERY=$('"' * replace(strip(query), "\"" => "\\\"") * '"')
-            $(tap_upload_cmd(upload))
-            --insecure
-            --output $path
-            --location
-            $(URIs.uristring(syncurl))
-        `
+        fmtpart = isnothing(tap.format) ? String[] : ["-F", "FORMAT=$(tap.format)"]
+        cmd = Cmd(vcat(
+            [
+                "curl",
+                "-F", "REQUEST=doQuery",
+                "-F", "LANG=ADQL"
+            ],
+            fmtpart,
+            ["-F", "QUERY=$(strip(query))"],
+            tap_upload_cmd(upload),
+            [
+                "--insecure",
+                "--output", path,
+                "--location",
+                URIs.uristring(syncurl)
+            ]
+        ))
         run(pipeline(cmd))
         return path
     end
 end
 
-tap_upload_cmd(::Nothing) = []
-tap_upload_cmd(upload) = @p let
+tap_upload_cmd(::Nothing) = String[]
+tap_upload_cmd(upload)::Vector{String} = reduce(vcat, @p let
     upload
     map(keys(__), values(__)) do k, tbl
         vot_file = tempname()
         tbl |> VOTables.write(vot_file)
-        ["-F UPLOAD=$k,param:$k", "-F $k=@$vot_file"]
+        ["-F", "UPLOAD=$k,param:$k", "-F", "$k=@$vot_file"]
     end
-    flatten
-end
+end)
