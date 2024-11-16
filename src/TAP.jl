@@ -47,45 +47,75 @@ Execute the ADQL `query` at the specified TAP service, and return the result as 
 execute(tap::TAPService, query::AbstractString; upload=nothing, kwargs...) = execute(StructArray, tap, query; upload, kwargs...)
 execute(T::Type, tap::TAPService, query::AbstractString; upload=nothing, kwargs...) = @p download(tap, query; upload) |> VOTables.read(T; kwargs...)
 
-function Base.download(tap::TAPService, query::AbstractString, path=tempname(); upload=nothing)
+function Base.download(tap::TAPService, adqlquery::AbstractString, path=tempname(); upload=nothing)
+    # URL and headers are the same regardless of upload
     syncurl = @p tap.baseurl |> @modify(joinpath(_, "sync"), __.path)
+    headers = []
+
+    # Temporary (VOTable) files to close after request (if any)
+    votios2close = IO[]
+
+    # Method, body, query are different for uploading vs not uploading
     if isnothing(upload)
-        # should probably work with POST as well by design, but some services prefer GET when possible
-        uri = URI(syncurl; query = [[
+        # Not uploading
+        method = "GET"
+        body = []
+        query = Pair{AbstractString,AbstractString}[
             "request" => "doQuery",
             "lang" => "ADQL",
-            "query" => strip(query),
-        ];
-            isnothing(tap.format) ? [] : ["FORMAT" => tap.format];
-        ])
-        download(uri, path)
+            "query" => strip(adqlquery),
+        ]
+        isnothing(tap.format) || push!(query, "FORMAT" => tap.format);
     else
-        # XXX: try to make the same request with HTTP.jl
-        fmtpart = isnothing(tap.format) ? `` : `-F FORMAT="$(tap.format)"`
-        cmd = `
-            curl
-            -F REQUEST=doQuery
-            -F LANG=ADQL
-            $fmtpart
-            -F QUERY=$('"' * replace(strip(query), "\"" => "\\\"") * '"')
-            $(tap_upload_cmd(upload))
-            --insecure
-            --output $path
-            --location
-            $(URIs.uristring(syncurl))
-        `
-        run(pipeline(cmd))
-        return path
-    end
-end
+        # Uploading
+        method = "POST"
+        query = []
+        body = begin
+            formdata = Pair{String,Any}[
+                "REQUEST" => "doQuery",
+                "LANG" => "ADQL",
+                "QUERY" => strip(adqlquery),
+            ]
+            isnothing(tap.format) || push!(formdata, "FORMAT" => tap.format)
 
-tap_upload_cmd(::Nothing) = []
-tap_upload_cmd(upload) = @p let
-    upload
-    map(keys(__), values(__)) do k, tbl
-        vot_file = tempname()
-        tbl |> VOTables.write(vot_file)
-        ["-F UPLOAD=$k,param:$k", "-F $k=@$vot_file"]
+            for (k,tbl) in pairs(upload)
+                push!(formdata, "UPLOAD" => "$k,param:$k")
+
+                vot_file = tempname()
+                VOTables.write(vot_file, tbl)
+                votio = open(vot_file)
+                push!(votios2close, votio) # Save VOTable IO to close later
+                push!(formdata, string(k) => HTTP.Multipart(basename(vot_file), votio, "application/x-votable+xml"))
+            end
+
+            HTTP.Form(formdata)
+        end
     end
-    flatten
+
+    # Now make request and write response body to path
+    open(path, "w") do response_stream
+        # 1. Use require_ssl_verification=false to match the previous use of
+        #    curl's --insecure option (even though tests pass without it).
+        #
+        # 2. Use pool=HTTP.Pool(1) to make tests pass (avoids concurrency
+        #    issues?)
+        #
+        # The user can override these and/or use other HTTP.request kwargs by
+        # putting them in the HTTP_REQUEST_OPTIONS Dict{Symbol,Any}.
+        resp = HTTP.request(method, syncurl, headers, body;
+            require_ssl_verification=false, # Allow user to override these...
+            pool=HTTP.Pool(1),
+            HTTP_REQUEST_OPTIONS..., # ...with kwargs given here...
+            query, response_stream # ...but not these
+        )
+
+        if resp.status != HTTP.StatusCodes.OK
+            @warn "Unexpected HTTP status code $(resp.status):\n$(resp.body)"
+        end
+    end
+
+    # Close votios (if any)
+    foreach(close, votios2close)
+
+    return path
 end
