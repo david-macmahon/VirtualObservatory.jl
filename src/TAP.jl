@@ -52,9 +52,6 @@ function Base.download(tap::TAPService, adqlquery::AbstractString, path=tempname
     syncurl = @p tap.baseurl |> @modify(joinpath(_, "sync"), __.path)
     headers = []
 
-    # Temporary (VOTable) files to close after request (if any)
-    votios2close = IO[]
-
     # Method, body, query are different for uploading vs not uploading
     if isnothing(upload)
         # Not uploading
@@ -83,9 +80,8 @@ function Base.download(tap::TAPService, adqlquery::AbstractString, path=tempname
 
                 vot_file = tempname()
                 VOTables.write(vot_file, tbl)
-                votio = open(vot_file)
-                push!(votios2close, votio) # Save VOTable IO to close later
-                push!(formdata, string(k) => HTTP.Multipart(basename(vot_file), votio, "application/x-votable+xml"))
+                votiob = open(io->IOBuffer(read(io)), vot_file)
+                push!(formdata, string(k) => HTTP.Multipart(basename(vot_file), votiob, "application/x-votable+xml"))
             end
 
             HTTP.Form(formdata)
@@ -113,9 +109,6 @@ function Base.download(tap::TAPService, adqlquery::AbstractString, path=tempname
             @warn "Unexpected HTTP status code $(resp.status):\n$(resp.body)"
         end
     end
-
-    # Close votios (if any)
-    foreach(close, votios2close)
 
     return path
 end
